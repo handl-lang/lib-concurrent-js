@@ -1,0 +1,722 @@
+--- concurrent-js -- JavaScript backend for the `concurrent` contract.
+---
+--- A cooperative scheduler for step-arrow tasks (see `concurrent.hnl`
+--- for the Step protocol), mirroring `concurrent-epoll` arrow for arrow
+--- wherever the op is expressible without an OS. The scheduler is a
+--- `while` loop over a record of queues — deterministic dataflow
+--- threaded through the JS host's clock and sleep primitives
+--- (ADR-0072: the non-determinism lives in the event stream, not the
+--- graph). No preemption: a task holds the machine for exactly one
+--- arrow invocation.
+---
+--- Scheduler state:
+---   runq    runnable entries  { id, arrow, input, stack, token }
+---   cw      channel waiters   { chan, select, kind, id, arrow, state, stack, token, value }
+---   tw      task waiters      { task, id, arrow, state, stack, token, timeout? }
+---   timers  sleeps+timeouts   { deadline, id, arrow, state, stack, token, await_task }
+---   chans   { id, cap, queue }  mutexes/rwlocks/sems/atomics/tokens
+---   live    ids of unfinished tasks   results  { id, value } pairs
+---   wtried/wi32  lazy SharedArrayBuffer+Int32Array for Atomics.wait
+---
+--- `stack` is the `enter` frame stack: running `{ call: { name: "enter",
+--- arrow, init } }` pushes `{ arrow, state }` and continues the task
+--- under the task arrow; a nested `{ out: v }` pops the frame and
+--- resumes the caller's state with `result = v`.
+---
+--- ## Design notes (why this is not "epoll with different syscalls")
+---
+--- - Channels, mutexes, rwlocks, semaphores, atomics and cancel
+---   tokens are *scheduler state*, implemented in pure handl exactly as
+---   in `concurrent-epoll` — NOT `MessageChannel`/`MessagePort` or the
+---   JS `Atomics` object. The contract's channel ops are synchronous
+---   rendezvous/bounded-queue exchanges resolved inside one scheduler
+---   step; `MessagePort.postMessage` delivers on a later task of the
+---   host event loop and cannot express "hand this value to a parked
+---   receiver now". (The contract's `atomic_*` ops are likewise
+---   cooperative-task atomics over scheduler state — the JS `Atomics`
+---   namespace is only borrowed below for `Atomics.wait` sleep.)
+--- - `sleep`/`await_timeout` park in `timers` exactly like epoll. When
+---   the runq drains with timers pending, `wait_timers` sleeps until
+---   the earliest deadline: `Atomics.wait` on a shared Int32Array where
+---   the host allows it (Node, workers, Deno — anywhere
+---   `SharedArrayBuffer` exists and `Atomics.wait` isn't barred, e.g.
+---   not the browser main thread), falling back to a `Date.now` spin.
+---   The spin is honest: `run` owns the host thread for its whole
+---   duration anyway (the contract's `Run` is a synchronous arrow), so
+---   no JS work could interleave during the wait regardless.
+--- - fd I/O (`recv`/`send`/`accept`/`connect_wait`/`close`), curl
+---   (`curl_perform`), TLS (`tls_*`) and WebSocket (`ws_*`) ops have no
+---   synchronous JS equivalent — there is no non-blocking fd API on the
+---   JS host — so they raise `concurrent-js: <op> unsupported` instead
+---   of silently misbehaving. The contract does not require every op;
+---   a backend resolves what it can.
+--- - `yield`, `spawn`, `await`, `enter` and the whole `chan_*`/lock/
+---   token vocabulary are host-independent and behave identically to
+---   `concurrent-epoll`, so isomorphic handl code gets the same
+---   semantics on client and server.
+---
+--- Requires a JS host for the clock/sleep path (`js.call`/`js.construct`
+--- through the `js` ffi). Pure scheduling workloads (no `sleep` /
+--- `await_timeout`) never touch `js.*` and run on any host.
+
+from "concurrent" import { Task, Run }
+from "js" import { call, construct, error as js_error }
+
+-- ---------------------------------------------------------------
+-- small utilities
+-- ---------------------------------------------------------------
+
+alen := (xs) ~> while { xs: xs, n: 0 } {
+  (xs, n) ~> match xs {
+    []: { out: n },
+    [h, ...t]: { state: { xs: t, n: n + 1 } }
+  }
+}
+
+afirst := (xs) ~> match xs {
+  []: null,
+  [h, ...t]: h
+}
+
+adrop := (xs, n) ~> while { xs: xs, n: n } {
+  (xs, n) ~> if n <= 0 {
+    { out: xs }
+  } else {
+    match xs {
+      []: { out: [] },
+      [h, ...t]: { state: { xs: t, n: n - 1 } }
+    }
+  }
+}
+
+find_where := (xs, p) ~> while xs {
+  (xs) ~> match xs {
+    []: { out: null },
+    [h, ...t]: if p(h) { { out: h } } else { { state: t } }
+  }
+}
+
+acontains := (xs, v) ~> find_where(xs, (x) ~> x == v) != null
+
+ais_empty := (xs) ~> xs == []
+
+has_field := (m, k) ~> acontains(obj.keys(m), k)
+
+drop_where := (xs, p) ~> while { xs: xs, acc: [] } {
+  (xs, acc) ~> match xs {
+    []: { out: acc },
+    [h, ...t]: if p(h) {
+      { state: { xs: t, acc: acc } }
+    } else {
+      { state: { xs: t, acc: [...acc, h] } }
+    }
+  }
+}
+
+-- ---------------------------------------------------------------
+-- JS host primitives (the only `js.*` surface this backend uses)
+-- ---------------------------------------------------------------
+
+--- wall clock in ms — `Date.now()` through the js ffi. Only reached
+--- when a timer is armed or fired, so timer-free workloads never call
+--- into the JS host.
+js_now := (_u) ~> call("Date", "now", [], [], "js_number", false)
+
+--- spin until `end` (a `js_now` reading). The fallback sleep for hosts
+--- where `Atomics.wait` is unavailable or barred (browser main thread).
+spin_until := (end) ~> while { end: end } {
+  (st) ~> if js_now(null) >= st.end {
+    { out: null }
+  } else {
+    { state: st }
+  }
+}
+
+spin_ms := (ms) ~> do {
+  _ := spin_until(js_now(null) + ms)
+  null
+}
+
+--- lazily build the SharedArrayBuffer+Int32Array `Atomics.wait`
+--- sleeps on. `wtried` latches so a host without the primitives pays
+--- the construction cost once, then spins forever after.
+ensure_wi32 := (s) ~> do {
+  if s.wtried {
+    s
+  } else {
+    do {
+      sab := construct("", "SharedArrayBuffer", [16],
+        ["js_number"], "js_object", false)
+      e1 := js_error()
+      if e1 != null {
+        hash_map.set(hash_map.set(s, "wtried", true), "wi32", false)
+      } else {
+        i32 := construct("", "Int32Array", [sab],
+          ["js_object"], "js_object", false)
+        e2 := js_error()
+        if e2 != null {
+          hash_map.set(hash_map.set(s, "wtried", true), "wi32", false)
+        } else {
+          hash_map.set(hash_map.set(s, "wtried", true), "wi32", i32)
+        }
+      }
+    }
+  }
+}
+
+--- sleep `ms` milliseconds, returning the (possibly updated) sched
+--- state. `Atomics.wait(i32, 0, 0, ms)` blocks the host thread for real
+--- where allowed; the Int32Array stays zeroed so the expected value
+--- always matches and the call always runs to its timeout ("timed-out"
+--- — we never `Atomics.notify`, so "ok" cannot occur). Any failure —
+--- missing `SharedArrayBuffer`, barred `Atomics.wait` on the browser
+--- main thread, a host without the js natives — falls back to the
+--- `Date.now` spin, which is correct everywhere `js.call` works.
+wait_ms := (s, ms) ~> do {
+  s1 := ensure_wi32(s)
+  if s1.wi32 == false || s1.wi32 == null {
+    _ := spin_ms(ms)
+    s1
+  } else {
+    _ := call("Atomics", "wait", [s1.wi32, 0, 0, ms],
+      ["js_object", "js_number", "js_number", "js_number"],
+      "js_string", false)
+    e := js_error()
+    if e == null {
+      s1
+    } else {
+      -- this host refuses Atomics.wait: stop retrying it
+      s2 := hash_map.set(s1, "wi32", false)
+      _ := spin_ms(ms)
+      s2
+    }
+  }
+}
+
+-- ---------------------------------------------------------------
+-- task entries
+-- ---------------------------------------------------------------
+
+--- push a parked frame back onto the runq, `result` merged into state
+resume := (s, e, st, v) ~> hash_map.set(s, "runq", [...s.runq, {
+    id: e.id, arrow: e.arrow,
+    input: hash_map.set(st, "result", v),
+    stack: e.stack, token: e.token
+  }])
+
+--- task finished with value v: record the result, drop it from live,
+--- and wake anyone parked in `tw` on its id (clearing their paired
+--- await_timeout timers).
+finish_task := (s, e, v) ~> do {
+  s1 := hash_map.set(s, "results", [...s.results, { id: e.id, value: v }])
+  s2 := hash_map.set(s1, "live", drop_where(s1.live, (i) ~> i == e.id))
+  ws := drop_where(s2.tw, (w) ~> w.task == e.id)
+  mine := drop_where(s2.tw, (w) ~> w.task != e.id)
+  s3 := hash_map.set(s2, "tw", ws)
+  s4 := hash_map.set(s3, "timers",
+    drop_where(s3.timers, (t) ~> t.await_task == e.id &&
+      find_where(mine, (w) ~> w.id == t.id) != null))
+  while { xs: mine, s: s4 } {
+    (xs, s) ~> match xs {
+      []: { out: s },
+      [w, ...t]: {
+        state: { xs: t, s: resume(s, w, w.state,
+          if hash_map.get_or(w, "timeout", false) { { done: v } } else { v }) }
+      }
+    }
+  }
+}
+
+token_set := (s, tok) ~> do {
+  t := if tok == null { null } else {
+    find_where(s.tokens, (x) ~> x.id == tok)
+  }
+  t != null && t.cancelled
+}
+
+-- ---------------------------------------------------------------
+-- channels / synchronization
+-- ---------------------------------------------------------------
+
+--- does this parked channel waiter match (chan, kind)?
+cw_match := (w, chan, kind) ~> w.kind == kind && (w.chan == chan ||
+  (w.select != null && acontains(w.select, chan)))
+
+chan_of := (s, id) ~> find_where(s.chans, (c) ~> c.id == id)
+
+set_chan := (s, ch) ~> hash_map.set(s, "chans",
+  [...drop_where(s.chans, (c) ~> c.id == ch.id), ch])
+
+v_of_select := (w, chan, v) ~> do {
+  if w.select == null {
+    v
+  } else {
+    { chan: chan, value: v }
+  }
+}
+
+recv_val := (select, chan, v) ~> do {
+  if select {
+    { chan: chan, value: v }
+  } else {
+    v
+  }
+}
+
+--- hand `req.value` to a parked receiver if any; else queue it; else
+--- park the sender.
+chan_send := (s, e, req, st) ~> do {
+  ch := chan_of(s, req.chan)
+  w := find_where(s.cw, (x) ~> cw_match(x, req.chan, "recv"))
+  if w != null {
+    s1 := hash_map.set(s, "cw", drop_where(s.cw, (x) ~> x.id == w.id))
+    s2 := resume(s1, w, w.state, v_of_select(w, req.chan, req.value))
+    resume(s2, e, st, { sent: true })
+  } else if alen(ch.queue) < ch.cap {
+    s1 := set_chan(s, hash_map.set(ch, "queue", [...ch.queue, req.value]))
+    resume(s1, e, st, { sent: true })
+  } else {
+    hash_map.set(s, "cw", [...s.cw, {
+      chan: req.chan, select: null, kind: "send",
+      id: e.id, arrow: e.arrow, state: st,
+      stack: e.stack, token: e.token, value: req.value
+    }])
+  }
+}
+
+--- take from the first ready channel in `chans` (nonempty queue or a
+--- parked sender); `select` shapes the resumed value as {chan, value}.
+chan_recv := (s, e, req, st, chans, select) ~> do {
+  ready := find_where(chans, (id) ~> do {
+    ch := chan_of(s, id)
+    alen(ch.queue) > 0 ||
+      find_where(s.cw, (x) ~> cw_match(x, id, "send")) != null
+  })
+  if ready == null {
+    sel := if select { chans } else { null }
+    hash_map.set(s, "cw", [...s.cw, {
+      chan: afirst(chans), select: sel, kind: "recv",
+      id: e.id, arrow: e.arrow, state: st,
+      stack: e.stack, token: e.token, value: null
+    }])
+  } else {
+    ch := chan_of(s, ready)
+    w := find_where(s.cw, (x) ~> cw_match(x, ready, "send"))
+    if alen(ch.queue) > 0 {
+      v := afirst(ch.queue)
+      ch1 := hash_map.set(ch, "queue", adrop(ch.queue, 1))
+      if w == null {
+        s1 := set_chan(s, ch1)
+        resume(s1, e, st, recv_val(select, ready, v))
+      } else {
+        -- parked sender refills the slot and completes
+        ch2 := hash_map.set(ch1, "queue", [...ch1.queue, w.value])
+        s1 := set_chan(s, ch2)
+        s2 := hash_map.set(s1, "cw", drop_where(s1.cw, (x) ~> x.id == w.id))
+        s3 := resume(s2, w, w.state, { sent: true })
+        resume(s3, e, st, recv_val(select, ready, v))
+      }
+    } else {
+      -- empty queue, parked sender: rendezvous directly
+      s1 := hash_map.set(s, "cw", drop_where(s.cw, (x) ~> x.id == w.id))
+      s2 := resume(s1, w, w.state, { sent: true })
+      resume(s2, e, st, recv_val(select, ready, w.value))
+    }
+  }
+}
+
+sync_of := (xs, id) ~> find_where(xs, (x) ~> x.id == id)
+
+set_in := (s, key, xs, x) ~> hash_map.set(s, key,
+  [...drop_where(xs, (y) ~> y.id == x.id), x])
+
+mutex_lock := (s, e, req, st) ~> do {
+  m := sync_of(s.mutexes, req.mutex)
+  if m.held {
+    s1 := set_in(s, "mutexes", s.mutexes,
+      hash_map.set(m, "queue", [...m.queue, {
+        id: e.id, arrow: e.arrow, state: st,
+        stack: e.stack, token: e.token, value: null
+      }]))
+    s1
+  } else {
+    s1 := set_in(s, "mutexes", s.mutexes, hash_map.set(m, "held", true))
+    resume(s1, e, st, { acquired: true })
+  }
+}
+
+mutex_unlock := (s, e, req, st) ~> do {
+  m := sync_of(s.mutexes, req.mutex)
+  if alen(m.queue) > 0 {
+    w := afirst(m.queue)
+    m1 := hash_map.set(m, "queue", adrop(m.queue, 1))
+    s1 := set_in(s, "mutexes", s.mutexes, m1)
+    s2 := resume(s1, w, w.state, { acquired: true })
+    resume(s2, e, st, { released: true })
+  } else {
+    s1 := set_in(s, "mutexes", s.mutexes, hash_map.set(m, "held", false))
+    resume(s1, e, st, { released: true })
+  }
+}
+
+rw_lock := (s, e, req, st, write) ~> do {
+  l := sync_of(s.rwlocks, req.rwlock)
+  waiters := if write { l.wq } else { l.rq }
+  can := if write {
+    l.writer == 0 && l.readers == 0
+  } else {
+    l.writer == 0 && alen(l.wq) == 0
+  }
+  if can {
+    l1 := if write {
+      hash_map.set(l, "writer", e.id)
+    } else {
+      hash_map.set(l, "readers", l.readers + 1)
+    }
+    s1 := set_in(s, "rwlocks", s.rwlocks, l1)
+    resume(s1, e, st, { acquired: true })
+  } else {
+    key := if write { "wq" } else { "rq" }
+    s1 := set_in(s, "rwlocks", s.rwlocks, hash_map.set(l, key, [...waiters, {
+      id: e.id, arrow: e.arrow, state: st,
+      stack: e.stack, token: e.token, value: null
+    }]))
+    s1
+  }
+}
+
+rw_unlock := (s, e, req, st) ~> do {
+  l := sync_of(s.rwlocks, req.rwlock)
+  l1 := if l.writer == e.id {
+    hash_map.set(l, "writer", 0)
+  } else {
+    hash_map.set(l, "readers", l.readers - 1)
+  }
+  -- hand off: waiting writers first when readers drain, else all readers
+  if l1.writer == 0 && l1.readers == 0 && alen(l1.wq) > 0 {
+    w := afirst(l1.wq)
+    l2 := hash_map.set(l1, "wq", adrop(l1.wq, 1))
+    l3 := hash_map.set(l2, "writer", w.id)
+    s1 := set_in(s, "rwlocks", s.rwlocks, l3)
+    s2 := resume(s1, w, w.state, { acquired: true })
+    resume(s2, e, st, { released: true })
+  } else if l1.writer == 0 && alen(l1.rq) > 0 {
+    s1 := set_in(s, "rwlocks", s.rwlocks, hash_map.set(l1, "rq", []))
+    s2 := while { xs: l1.rq, s: s1 } {
+      (xs, s) ~> match xs {
+        []: { out: s },
+        [w, ...t]: do {
+          l2 := sync_of(s.rwlocks, req.rwlock)
+          s3 := set_in(s, "rwlocks", s.rwlocks,
+            hash_map.set(l2, "readers", l2.readers + 1))
+          { state: { xs: t, s: resume(s3, w, w.state, { acquired: true }) } }
+        }
+      }
+    }
+    resume(s2, e, st, { released: true })
+  } else {
+    s1 := set_in(s, "rwlocks", s.rwlocks, l1)
+    resume(s1, e, st, { released: true })
+  }
+}
+
+sem_op := (s, e, req, st, acquire) ~> do {
+  m := sync_of(s.sems, req.sem)
+  if acquire {
+    if m.count > 0 {
+      s1 := set_in(s, "sems", s.sems, hash_map.set(m, "count", m.count - 1))
+      resume(s1, e, st, { acquired: true })
+    } else {
+      set_in(s, "sems", s.sems, hash_map.set(m, "queue", [...m.queue, {
+        id: e.id, arrow: e.arrow, state: st,
+        stack: e.stack, token: e.token, value: null
+      }]))
+    }
+  } else {
+    if alen(m.queue) > 0 {
+      w := afirst(m.queue)
+      s1 := set_in(s, "sems", s.sems,
+        hash_map.set(m, "queue", adrop(m.queue, 1)))
+      s2 := resume(s1, w, w.state, { acquired: true })
+      resume(s2, e, st, { released: true })
+    } else {
+      s1 := set_in(s, "sems", s.sems, hash_map.set(m, "count", m.count + 1))
+      resume(s1, e, st, { released: true })
+    }
+  }
+}
+
+-- ---------------------------------------------------------------
+-- op dispatch
+-- ---------------------------------------------------------------
+
+perform := (s, e, req, st) ~> match req.name {
+  "yield": resume(s, e, st, null),
+  "spawn": do {
+    id := s.next_id
+    s1 := hash_map.set(s, "next_id", id + 1)
+    s2 := hash_map.set(s1, "live", [...s1.live, id])
+    s3 := hash_map.set(s2, "runq", [...s2.runq, {
+      id: id, arrow: req.task, input: req.init,
+      stack: [], token: hash_map.get_or(req, "token", null)
+    }])
+    resume(s3, e, st, id)
+  },
+  "await": do {
+    r := find_where(s.results, (x) ~> x.id == req.task)
+    if r != null {
+      resume(s, e, st, r.value)
+    } else {
+      hash_map.set(s, "tw", [...s.tw, {
+        task: req.task, id: e.id, arrow: e.arrow, state: st,
+        stack: e.stack, token: e.token
+      }])
+    }
+  },
+  "await_timeout": do {
+    r := find_where(s.results, (x) ~> x.id == req.task)
+    if r != null {
+      resume(s, e, st, { done: r.value })
+    } else {
+      s1 := hash_map.set(s, "tw", [...s.tw, {
+        task: req.task, id: e.id, arrow: e.arrow, state: st,
+        stack: e.stack, token: e.token, timeout: true
+      }])
+      hash_map.set(s1, "timers", [...s1.timers, {
+        deadline: js_now(null) + req.ms, id: e.id, arrow: e.arrow,
+        state: st, stack: e.stack, token: e.token, await_task: req.task
+      }])
+    }
+  },
+  "sleep": hash_map.set(s, "timers", [...s.timers, {
+    deadline: js_now(null) + req.ms, id: e.id, arrow: e.arrow,
+    state: st, stack: e.stack, token: e.token, await_task: 0
+  }]),
+  "enter": hash_map.set(s, "runq", [...s.runq, {
+    id: e.id, arrow: req.arrow, input: req.init,
+    stack: [...e.stack, { arrow: e.arrow, state: st }], token: e.token
+  }]),
+  "chan_new": do {
+    id := s.next_chan
+    s1 := hash_map.set(s, "next_chan", id + 1)
+    s2 := hash_map.set(s1, "chans", [...s1.chans, { id: id, cap: req.cap, queue: [] }])
+    resume(s2, e, st, id)
+  },
+  "chan_send": chan_send(s, e, req, st),
+  "chan_recv": chan_recv(s, e, req, st, [req.chan], false),
+  "chan_select": chan_recv(s, e, req, st, req.chans, true),
+  "mutex_new": do {
+    id := s.next_mutex
+    s1 := hash_map.set(s, "next_mutex", id + 1)
+    s2 := hash_map.set(s1, "mutexes", [...s1.mutexes,
+      { id: id, held: false, queue: [] }])
+    resume(s2, e, st, id)
+  },
+  "mutex_lock": mutex_lock(s, e, req, st),
+  "mutex_unlock": mutex_unlock(s, e, req, st),
+  "rwlock_new": do {
+    id := s.next_rw
+    s1 := hash_map.set(s, "next_rw", id + 1)
+    s2 := hash_map.set(s1, "rwlocks", [...s1.rwlocks,
+      { id: id, readers: 0, writer: 0, rq: [], wq: [] }])
+    resume(s2, e, st, id)
+  },
+  "read_lock": rw_lock(s, e, req, st, false),
+  "write_lock": rw_lock(s, e, req, st, true),
+  "rw_unlock": rw_unlock(s, e, req, st),
+  "sem_new": do {
+    id := s.next_sem
+    s1 := hash_map.set(s, "next_sem", id + 1)
+    s2 := hash_map.set(s1, "sems", [...s1.sems,
+      { id: id, count: req.n, queue: [] }])
+    resume(s2, e, st, id)
+  },
+  "sem_acquire": sem_op(s, e, req, st, true),
+  "sem_release": sem_op(s, e, req, st, false),
+  "atomic_new": do {
+    id := s.next_atomic
+    s1 := hash_map.set(s, "next_atomic", id + 1)
+    s2 := hash_map.set(s1, "atomics", [...s1.atomics, { id: id, value: req.value }])
+    resume(s2, e, st, id)
+  },
+  "atomic_read": resume(s, e, st,
+    hash_map.get_or(sync_of(s.atomics, req.atomic), "value", null)),
+  "atomic_write": do {
+    a := sync_of(s.atomics, req.atomic)
+    s1 := set_in(s, "atomics", s.atomics, hash_map.set(a, "value", req.value))
+    resume(s1, e, st, a.value)
+  },
+  "atomic_cas": do {
+    a := sync_of(s.atomics, req.atomic)
+    if a.value == req.expect {
+      s1 := set_in(s, "atomics", s.atomics, hash_map.set(a, "value", req.value))
+      resume(s1, e, st, true)
+    } else {
+      resume(s, e, st, false)
+    }
+  },
+  "token_new": do {
+    id := s.next_token
+    s1 := hash_map.set(s, "next_token", id + 1)
+    s2 := hash_map.set(s1, "tokens", [...s1.tokens, { id: id, cancelled: false }])
+    resume(s2, e, st, id)
+  },
+  "cancel": do {
+    t := sync_of(s.tokens, req.token)
+    s1 := set_in(s, "tokens", s.tokens, hash_map.set(t, "cancelled", true))
+    resume(s1, e, st, { cancelled: true })
+  },
+  "cancelled": resume(s, e, st, token_set(s, req.token)),
+  -- fd I/O, curl, TLS and WebSocket ops: no synchronous JS equivalent.
+  "recv": error.raise("concurrent-js: recv unsupported (no synchronous fd I/O in JS)"),
+  "send": error.raise("concurrent-js: send unsupported (no synchronous fd I/O in JS)"),
+  "accept": error.raise("concurrent-js: accept unsupported (no synchronous fd I/O in JS)"),
+  "connect_wait": error.raise("concurrent-js: connect_wait unsupported (no synchronous fd I/O in JS)"),
+  "close": error.raise("concurrent-js: close unsupported (no synchronous fd I/O in JS)"),
+  "curl_perform": error.raise("concurrent-js: curl_perform unsupported"),
+  "ws_open": error.raise("concurrent-js: ws_open unsupported"),
+  "ws_recv": error.raise("concurrent-js: ws_recv unsupported"),
+  "ws_send": error.raise("concurrent-js: ws_send unsupported"),
+  "ws_close": error.raise("concurrent-js: ws_close unsupported"),
+  "tls_accept": error.raise("concurrent-js: tls_accept unsupported"),
+  "tls_connect": error.raise("concurrent-js: tls_connect unsupported"),
+  "tls_recv": error.raise("concurrent-js: tls_recv unsupported"),
+  "tls_send": error.raise("concurrent-js: tls_send unsupported"),
+  "tls_close": error.raise("concurrent-js: tls_close unsupported"),
+  _: error.raise("concurrent-js: unknown req " + req.name)
+}
+
+-- ---------------------------------------------------------------
+-- the loop
+-- ---------------------------------------------------------------
+
+--- one runnable task takes one step
+tick := (s) ~> do {
+  e := afirst(s.runq)
+  s1 := hash_map.set(s, "runq", adrop(s.runq, 1))
+  if token_set(s1, e.token) {
+    finish_task(s1, e, { cancelled: true })
+  } else {
+    f := e.arrow
+    step := f(e.input)
+    if has_field(step, "out") {
+      if ais_empty(e.stack) {
+        finish_task(s1, e, step.out)
+      } else {
+        fr := afirst(e.stack)
+        hash_map.set(s1, "runq", [...s1.runq, {
+          id: e.id, arrow: fr.arrow,
+          input: hash_map.set(fr.state, "result", step.out),
+          stack: adrop(e.stack, 1), token: e.token
+        }])
+      }
+    } else if has_field(step, "call") {
+      perform(s1, e, step.call, step.state)
+    } else {
+      hash_map.set(s1, "runq", [...s1.runq, {
+        id: e.id, arrow: e.arrow, input: step.state,
+        stack: e.stack, token: e.token
+      }])
+    }
+  }
+}
+
+--- fire every expired timer; resumes with { timeout: task } for
+--- await_timeout pairs (their `tw` entry is dropped) and null for sleep
+fire_timers := (s) ~> do {
+  if ais_empty(s.timers) {
+    s
+  } else {
+    now := js_now(null)
+    due := drop_where(s.timers, (t) ~> t.deadline <= now)
+    fired := drop_where(s.timers, (t) ~> t.deadline > now)
+    s1 := hash_map.set(s, "timers", due)
+    while { xs: fired, s: s1 } {
+      (xs, s) ~> match xs {
+        []: { out: s },
+        [t, ...rest]: do {
+          s2 := if t.await_task > 0 {
+            hash_map.set(s, "tw",
+              drop_where(s.tw, (w) ~> w.id == t.id && w.task == t.await_task))
+          } else {
+            s
+          }
+          v := if t.await_task > 0 { { timeout: t.await_task } } else { null }
+          { state: { xs: rest, s: resume(s2, t, t.state, v) } }
+        }
+      }
+    }
+  }
+}
+
+--- runq is empty and timers are armed: sleep until the earliest
+--- deadline (Atomics.wait where the host allows, Date.now spin
+--- otherwise), then let the loop's fire_timers pass collect it.
+wait_timers := (s) ~> do {
+  d := while { xs: s.timers, d: afirst(s.timers).deadline } {
+    (xs, d) ~> match xs {
+      []: { out: d },
+      [t, ...rest]: if t.deadline < d {
+        { state: { xs: rest, d: t.deadline } }
+      } else {
+        { state: { xs: rest, d: d } }
+      }
+    }
+  }
+  now := js_now(null)
+  dt := d - now
+  ms := if dt < 0 { 0 } else { dt }
+  wait_ms(s, ms)
+}
+
+new_sched := (task, init) ~> ({
+  runq: [{ id: 1, arrow: task, input: init, stack: [], token: null }],
+  cw: [], tw: [], timers: [],
+  chans: [], mutexes: [], rwlocks: [], sems: [], atomics: [], tokens: [],
+  live: [1], results: [],
+  next_id: 2, next_chan: 1, next_mutex: 1, next_rw: 1,
+  next_sem: 1, next_atomic: 1, next_token: 1,
+  wtried: false, wi32: null
+})
+
+final := (s) ~> ({
+  main: hash_map.get_or(
+    find_where(s.results, (r) ~> r.id == 1), "value", null),
+  results: s.results
+})
+
+--- run tasks until the main task (id 1) completes: drain the runq;
+--- when it empties fire due timers; when nothing can wake the parked
+--- tasks that's a deadlock; otherwise sleep until the next timer
+--- deadline. Spawned daemon tasks (e.g. a server loop) may still be
+--- live when main finishes -- run abandons them.
+export run := (task, init) ~> do {
+  fin := while new_sched(task, init) {
+    (s) ~> do {
+      if alen(s.runq) > 0 {
+        { state: tick(s) }
+      } else {
+        s1 := fire_timers(s)
+        if alen(s1.runq) > 0 {
+          { state: s1 }
+        } else if ais_empty(s1.live)
+            || find_where(s1.results, (r) ~> r.id == 1) != null {
+          { out: s1 }
+        } else if ais_empty(s1.timers) {
+          -- nothing runnable, no timers: tasks parked on channels or
+          -- other tasks can never wake (the epoll backend's fdw/mwait
+          -- wake sources do not exist here).
+          { out: s1 }
+        } else {
+          { state: wait_timers(s1) }
+        }
+      }
+    }
+  }
+  if ais_empty(fin.live)
+      || find_where(fin.results, (r) ~> r.id == 1) != null {
+    final(fin)
+  } else {
+    { deadlock: fin.live }
+  }
+}

@@ -1,0 +1,11 @@
+-- lib-concurrent-js: modules this package provides (entry defaults to
+-- src/index.hnl; N modules resolve to src/<name>/index.hnl).
+{
+  deps: { concurrent: "branch:main", js: "branch:main" },
+  modules: ["concurrent-js"],
+  name: "concurrent-js",
+  description: "JavaScript backend for the concurrent step-arrow contract — scheduler over js.call/js.construct primitives.",
+  license: "MIT",
+  keywords: ["concurrent", "async", "js", "backend", "scheduler"],
+  homepage: "https://github.com/handl-lang/lib-concurrent-js",
+}

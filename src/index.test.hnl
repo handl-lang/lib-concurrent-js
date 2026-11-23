@@ -1,0 +1,470 @@
+--- Smoke tests for the JavaScript `concurrent` backend: spawn/await,
+--- channels (rendezvous, bounded, select), mutex+atomic+cas, rwlock,
+--- semaphore, yield, enter, cancellation, await_timeout, and deadlock.
+---
+--- The scheduler core (channels, spawn, locks, atomics, tokens) is pure
+--- handl and runs on any host. `sleep` and the timeout-fires path of
+--- `await_timeout` reach the JS host through `js.call` (`Date.now`,
+--- `Atomics.wait`/`SharedArrayBuffer` with a `Date.now` spin fallback);
+--- on a host without the `js` natives those cases surface as
+--- `call_host` failures, which `scripts/hnl-gate.sh` tolerates — same
+--- convention as lib-json-js.
+
+from "./index" import { run }
+
+-- ---------------------------------------------------------------
+-- channel + spawn + await (rendezvous, cap 0)
+-- ---------------------------------------------------------------
+
+worker := (s) ~> match s.phase {
+  "start": { state: { phase: "mid", n: 40 } },
+  "mid": { out: s.n + 2 }
+}
+
+producer := (s) ~> match s.phase {
+  "p1": {
+    call: { name: "chan_send", chan: s.ch, value: 7 },
+    state: { phase: "p2", ch: s.ch }
+  },
+  "p2": {
+    call: { name: "chan_send", chan: s.ch, value: 35 },
+    state: { phase: "done" }
+  },
+  "done": { out: null }
+}
+
+consumer := (s) ~> match s.phase {
+  "c1": {
+    call: { name: "chan_recv", chan: s.ch },
+    state: { phase: "c2", ch: s.ch }
+  },
+  "c2": {
+    call: { name: "chan_recv", chan: s.ch },
+    state: { phase: "done", acc: s.result }
+  },
+  "done": { out: s.acc + s.result }
+}
+
+chan_main := (s) ~> match s.phase {
+  "new": {
+    call: { name: "chan_new", cap: 0 },
+    state: { phase: "spawn_c" }
+  },
+  "spawn_c": {
+    call: { name: "spawn", task: consumer, init: { phase: "c1", ch: s.result } },
+    state: { phase: "spawn_p", ch: s.result }
+  },
+  "spawn_p": {
+    call: { name: "spawn", task: producer, init: { phase: "p1", ch: s.ch } },
+    state: { phase: "await_c", cons: s.result }
+  },
+  "await_c": {
+    call: { name: "await", task: s.cons },
+    state: { phase: "spawn_w" }
+  },
+  "spawn_w": {
+    call: { name: "spawn", task: worker, init: { phase: "start" } },
+    state: { phase: "await_w", sum: s.result }
+  },
+  "await_w": {
+    call: { name: "await", task: s.result },
+    state: { phase: "done", sum: s.sum }
+  },
+  "done": { out: { chan_sum: s.sum, worker: s.result } }
+}
+
+r1 := run(chan_main, { phase: "new" })
+
+test_chan_sum := assert r1.main.chan_sum := 42
+
+test_spawn_await := assert r1.main.worker := 42
+
+-- ---------------------------------------------------------------
+-- bounded channel (cap 2): fill the queue, drain one slot, refill,
+-- then drain — exercises both the queue path and sender/receiver
+-- handoff without ever parking.
+-- ---------------------------------------------------------------
+
+bounded_main := (s) ~> match s.phase {
+  "new": {
+    call: { name: "chan_new", cap: 2 },
+    state: { phase: "s1" }
+  },
+  "s1": {
+    call: { name: "chan_send", chan: s.result, value: 1 },
+    state: { phase: "s2", ch: s.result }
+  },
+  "s2": {
+    call: { name: "chan_send", chan: s.ch, value: 2 },
+    state: { phase: "r1", ch: s.ch }
+  },
+  "r1": {
+    call: { name: "chan_recv", chan: s.ch },
+    state: { phase: "acc1", ch: s.ch }
+  },
+  "acc1": {
+    state: { phase: "s3", ch: s.ch, acc: s.result }
+  },
+  "s3": {
+    call: { name: "chan_send", chan: s.ch, value: 3 },
+    state: { phase: "r2", ch: s.ch, acc: s.acc }
+  },
+  "r2": {
+    call: { name: "chan_recv", chan: s.ch },
+    state: { phase: "acc2", ch: s.ch, acc: s.acc }
+  },
+  "acc2": {
+    state: { phase: "r3", ch: s.ch, acc: s.acc + s.result }
+  },
+  "r3": {
+    call: { name: "chan_recv", chan: s.ch },
+    state: { phase: "acc3", ch: s.ch, acc: s.acc }
+  },
+  "acc3": {
+    state: { phase: "done", acc: s.acc + s.result }
+  },
+  "done": { out: s.acc }
+}
+
+test_bounded_chan := assert run(bounded_main, { phase: "new" }).main := 6
+
+-- ---------------------------------------------------------------
+-- chan_select: two buffered channels, select reports the first ready
+-- one in list order as { chan: id, value: v }
+-- ---------------------------------------------------------------
+
+select_main := (s) ~> match s.phase {
+  "new1": {
+    call: { name: "chan_new", cap: 1 },
+    state: { phase: "new2" }
+  },
+  "new2": {
+    call: { name: "chan_new", cap: 1 },
+    state: { phase: "send1", c1: s.result }
+  },
+  "send1": {
+    call: { name: "chan_send", chan: s.c1, value: "first" },
+    state: { phase: "send2", c1: s.c1, c2: s.result }
+  },
+  "send2": {
+    call: { name: "chan_send", chan: s.c2, value: "second" },
+    state: { phase: "sel", c1: s.c1, c2: s.c2 }
+  },
+  "sel": {
+    call: { name: "chan_select", chans: [s.c1, s.c2] },
+    state: { phase: "done" }
+  },
+  "done": { out: s.result }
+}
+
+sel_r := run(select_main, { phase: "new1" })
+
+test_chan_select := assert sel_r.main.chan := 1
+
+test_chan_select_val := assert sel_r.main.value := "first"
+
+-- ---------------------------------------------------------------
+-- mutex + atomic: two tasks increment a shared counter under a lock
+-- ---------------------------------------------------------------
+
+counter := (s) ~> match s.phase {
+  "lock": {
+    call: { name: "mutex_lock", mutex: s.m },
+    state: { phase: "read", m: s.m, a: s.a }
+  },
+  "read": {
+    call: { name: "atomic_read", atomic: s.a },
+    state: { phase: "write", m: s.m, a: s.a }
+  },
+  "write": {
+    call: { name: "atomic_write", atomic: s.a, value: s.result + 1 },
+    state: { phase: "unlock", m: s.m, a: s.a }
+  },
+  "unlock": {
+    call: { name: "mutex_unlock", mutex: s.m },
+    state: { phase: "done" }
+  },
+  "done": { out: null }
+}
+
+mutex_main := (s) ~> match s.phase {
+  "mutex": {
+    call: { name: "mutex_new" },
+    state: { phase: "atomic" }
+  },
+  "atomic": {
+    call: { name: "atomic_new", value: 0 },
+    state: { phase: "spawn1", m: s.result }
+  },
+  "spawn1": {
+    call: { name: "spawn", task: counter, init: { phase: "lock", m: s.m, a: s.result } },
+    state: { phase: "spawn2", m: s.m, a: s.result }
+  },
+  "spawn2": {
+    call: { name: "spawn", task: counter, init: { phase: "lock", m: s.m, a: s.a } },
+    state: { phase: "await1", a: s.a, t1: s.result }
+  },
+  "await1": {
+    call: { name: "await", task: s.t1 },
+    state: { phase: "await2", a: s.a, t2: s.result }
+  },
+  "await2": {
+    call: { name: "await", task: s.t2 },
+    state: { phase: "read", a: s.a }
+  },
+  "read": {
+    call: { name: "atomic_read", atomic: s.a },
+    state: { phase: "done" }
+  },
+  "done": { out: s.result }
+}
+
+test_mutex := assert run(mutex_main, { phase: "mutex" }).main := 2
+
+-- ---------------------------------------------------------------
+-- atomic_cas: succeeds on match, fails otherwise, previous value on write
+-- ---------------------------------------------------------------
+
+cas_main := (s) ~> match s.phase {
+  "new": {
+    call: { name: "atomic_new", value: 10 },
+    state: { phase: "hit" }
+  },
+  "hit": {
+    call: { name: "atomic_cas", atomic: s.result, expect: 10, value: 11 },
+    state: { phase: "miss", a: s.result }
+  },
+  "miss": {
+    call: { name: "atomic_cas", atomic: s.a, expect: 10, value: 99 },
+    state: { phase: "read", a: s.a, hit: s.result }
+  },
+  "read": {
+    call: { name: "atomic_read", atomic: s.a },
+    state: { phase: "done", hit: s.hit, miss: s.result }
+  },
+  "done": { out: { hit: s.hit, miss: s.miss, value: s.result } }
+}
+
+cas_r := run(cas_main, { phase: "new" })
+
+test_cas_hit := assert cas_r.main.hit := true
+
+test_cas_miss := assert cas_r.main.miss := false
+
+test_cas_value := assert cas_r.main.value := 11
+
+-- atomic_write returns the previous value
+aw_main := (s) ~> match s.phase {
+  "new": {
+    call: { name: "atomic_new", value: 7 },
+    state: { phase: "wr" }
+  },
+  "wr": {
+    call: { name: "atomic_write", atomic: s.result, value: 8 },
+    state: { phase: "done" }
+  },
+  "done": { out: s.result }
+}
+
+test_atomic_write_prev := assert run(aw_main, { phase: "new" }).main := 7
+
+-- ---------------------------------------------------------------
+-- rwlock: writer excludes, readers share, unlock hands off
+-- ---------------------------------------------------------------
+
+rw_main := (s) ~> match s.phase {
+  "new": {
+    call: { name: "rwlock_new" },
+    state: { phase: "wl" }
+  },
+  "wl": {
+    call: { name: "write_lock", rwlock: s.result },
+    state: { phase: "wu", l: s.result }
+  },
+  "wu": {
+    call: { name: "rw_unlock", rwlock: s.l },
+    state: { phase: "rl1", l: s.l }
+  },
+  "rl1": {
+    call: { name: "read_lock", rwlock: s.l },
+    state: { phase: "rl2", l: s.l }
+  },
+  "rl2": {
+    call: { name: "read_lock", rwlock: s.l },
+    state: { phase: "ru", l: s.l }
+  },
+  "ru": {
+    call: { name: "rw_unlock", rwlock: s.l },
+    state: { phase: "ru2", l: s.l }
+  },
+  "ru2": {
+    call: { name: "rw_unlock", rwlock: s.l },
+    state: { phase: "done" }
+  },
+  "done": { out: "rw-ok" }
+}
+
+test_rwlock := assert run(rw_main, { phase: "new" }).main := "rw-ok"
+
+-- ---------------------------------------------------------------
+-- semaphore: acquire consumes a permit, release returns it
+-- ---------------------------------------------------------------
+
+sem_main := (s) ~> match s.phase {
+  "new": {
+    call: { name: "sem_new", n: 1 },
+    state: { phase: "acq" }
+  },
+  "acq": {
+    call: { name: "sem_acquire", sem: s.result },
+    state: { phase: "rel", sem: s.result }
+  },
+  "rel": {
+    call: { name: "sem_release", sem: s.sem },
+    state: { phase: "done" }
+  },
+  "done": { out: "sem-ok" }
+}
+
+test_sem := assert run(sem_main, { phase: "new" }).main := "sem-ok"
+
+-- ---------------------------------------------------------------
+-- yield: requeues the task, resumes with null
+-- ---------------------------------------------------------------
+
+yielder := (s) ~> match s.phase {
+  "y": {
+    call: { name: "yield" },
+    state: { phase: "done", n: s.n + 1 }
+  },
+  "done": { out: s.n }
+}
+
+test_yield := assert run(yielder, { phase: "y", n: 41 }).main := 42
+
+-- ---------------------------------------------------------------
+-- enter: run an arrow as a sub-task; its { out: v } resumes the
+-- caller's state with result = v
+-- ---------------------------------------------------------------
+
+sub := (s) ~> match s.phase {
+  "go": { state: { phase: "fin", n: s.n * 2 } },
+  "fin": { out: s.n + 1 }
+}
+
+enter_main := (s) ~> match s.phase {
+  "go": {
+    call: { name: "enter", arrow: sub, init: { phase: "go", n: 20 } },
+    state: { phase: "done" }
+  },
+  "done": { out: s.result }
+}
+
+test_enter := assert run(enter_main, { phase: "go" }).main := 41
+
+-- ---------------------------------------------------------------
+-- cancellation: a token set before the task's next step finishes it
+-- early with { cancelled: true }
+-- ---------------------------------------------------------------
+
+cancellable := (s) ~> match s.phase {
+  "go": { state: { phase: "step2" } },
+  "step2": { out: "finished" }
+}
+
+cancel_main := (s) ~> match s.phase {
+  "tok": {
+    call: { name: "token_new" },
+    state: { phase: "spawn" }
+  },
+  "spawn": {
+    call: { name: "spawn", task: cancellable,
+      init: { phase: "go" }, token: s.result },
+    state: { phase: "cancel", tok: s.result }
+  },
+  "cancel": {
+    call: { name: "cancel", token: s.tok },
+    state: { phase: "await_t", tok: s.tok, t: s.result }
+  },
+  "await_t": {
+    call: { name: "await", task: s.t },
+    state: { phase: "chk", tok: s.tok }
+  },
+  "chk": {
+    call: { name: "cancelled", token: s.tok },
+    state: { phase: "done", res: s.result }
+  },
+  "done": { out: { res: s.res, flag: s.result } }
+}
+
+cancel_r := run(cancel_main, { phase: "tok" })
+
+test_cancel_result := assert cancel_r.main.res := { cancelled: true }
+
+test_cancel_flag := assert cancel_r.main.flag := true
+
+-- ---------------------------------------------------------------
+-- await_timeout, task finishes first: resumes { done: v } and the
+-- armed timer is dropped — runs without touching the JS clock.
+-- ---------------------------------------------------------------
+
+quick := (s) ~> { out: "quick-v" }
+
+await_to_main := (s) ~> match s.phase {
+  "spawn": {
+    call: { name: "spawn", task: quick, init: null },
+    state: { phase: "wait" }
+  },
+  "wait": {
+    call: { name: "await_timeout", task: s.result, ms: 60000 },
+    state: { phase: "done" }
+  },
+  "done": { out: s.result }
+}
+
+test_await_timeout_done := assert run(await_to_main, { phase: "spawn" }).main := { done: "quick-v" }
+
+-- ---------------------------------------------------------------
+-- sleep: needs the JS clock (`Date.now`/`Atomics.wait`) — fails as
+-- call_host on hosts without the js natives (tolerated by the gate).
+-- ---------------------------------------------------------------
+
+sleeper := (s) ~> match s.phase {
+  "go": { call: { name: "sleep", ms: 1 }, state: { phase: "done" } },
+  "done": { out: "slept" }
+}
+
+test_sleep := assert run(sleeper, { phase: "go" }).main := "slept"
+
+-- ---------------------------------------------------------------
+-- deadlock: main and a spawned task both park on chan_recv of a
+-- channel nobody sends to — run reports { deadlock: [ids] }
+-- ---------------------------------------------------------------
+
+waiter := (s) ~> match s.phase {
+  "w": {
+    call: { name: "chan_recv", chan: s.ch },
+    state: { phase: "done" }
+  },
+  "done": { out: null }
+}
+
+deadlock_main := (s) ~> match s.phase {
+  "new": {
+    call: { name: "chan_new", cap: 0 },
+    state: { phase: "spawn" }
+  },
+  "spawn": {
+    call: { name: "spawn", task: waiter, init: { phase: "w", ch: s.result } },
+    state: { phase: "block", ch: s.result }
+  },
+  "block": {
+    call: { name: "chan_recv", chan: s.ch },
+    state: { phase: "done" }
+  },
+  "done": { out: null }
+}
+
+deadlock_r := run(deadlock_main, { phase: "new" })
+
+test_deadlock := assert deadlock_r = { deadlock: [1, 2] }

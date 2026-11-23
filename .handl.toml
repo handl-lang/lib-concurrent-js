@@ -1,0 +1,6 @@
+[dependencies]
+concurrent = { path = "../lib-concurrent/src" }
+js = { path = "../lib-js/src" }
+
+# own package
+concurrent-js = { path = "src" }
