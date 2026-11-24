@@ -467,4 +467,4 @@ deadlock_main := (s) ~> match s.phase {
 
 deadlock_r := run(deadlock_main, { phase: "new" })
 
-test_deadlock := assert deadlock_r = { deadlock: [1, 2] }
+test_deadlock := assert deadlock_r == { deadlock: [1, 2] }
