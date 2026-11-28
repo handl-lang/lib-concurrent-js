@@ -12,7 +12,7 @@ handl over `js.call`/`js.construct` primitives.
 | --- | --- |
 | `src/index.hnl` | the scheduler — mirrors `concurrent-epoll` arrow for arrow where expressible without an OS |
 | `src/index.test.hnl` | tests |
-| `pkg.hnl` | manifest — deps `concurrent`, `js` (`branch:main`) |
+| `pkg.hnl` | manifest — dep `concurrent` only (`js` is a host/builtin contract, NOT a dep — see Contract) |
 | `scripts/hnl-gate.sh` | `.hnl` gate |
 | `workflows/gate.yaml` | CI — shared `handl-gates` campaign |
 
@@ -21,6 +21,15 @@ handl over `js.call`/`js.construct` primitives.
 - Channels, mutexes, rwlocks, semaphores, atomics and cancel tokens are
   scheduler state with semantics identical to the epoll backend.
 - Pure `.hnl` over the `js` ffi; no Rust crate.
+- `js` stays out of `pkg.hnl` `deps` and `.handl.toml`
+  `[dependencies]`: the `js` contract is a host/builtin surface
+  (compile-js binds `from "js"` to `__handl_rt` shims regardless of
+  dep tables). Declaring the dep makes `hnl run`/`hnl test` resolve
+  `js` to `lib-js`'s signature-only exports — `call` erases to `null`
+  and every call dies with "callee is not an arrow-value". Undeclared,
+  the import lowers to the ambient `"js.call"` callee and fails
+  honestly as `call_host: function 'js.call' not found` on hosts
+  without JS natives (the shape `scripts/hnl-gate.sh` tolerates).
 
 ## Verification
 
